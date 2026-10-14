@@ -143,6 +143,8 @@ void ValidateValueReferences(const IrProgram& program, ShaderStageInputInfo inpu
                         }
                         case StageInputKind::Layer:
                         case StageInputKind::SampleId:
+                        case StageInputKind::RasterPrimitive:
+                        case StageInputKind::LayerExported:
                             if (program.Resources().stage != IrShaderStage::Pixel || component != 0u) {
                                 return Fail("typed pixel scalar input is invalid");
                             }
@@ -234,7 +236,7 @@ bool IsPixelParameterFlat(const ShaderPixelInputInfo& pixel, std::uint32_t input
 }
 
 void CollectPixelInputs(const IrProgram& program, const ShaderPixelInputInfo* pixel, ShaderInfo& info) {
-    if (pixel->HasPositionInput()) {
+    if (pixel->HasPositionInput() || pixel->psDitheredAlphaToCoverage) {
         AddInput(info, StageInputKind::FragCoord, 0, 4, "gl_FragCoord");
     }
     if (pixel->psFrontFace) {
@@ -257,7 +259,7 @@ void CollectPixelInputs(const IrProgram& program, const ShaderPixelInputInfo* pi
                 const auto input = inst->Argument(0)->Resolve()->ImmediateU32();
                 const auto mode = inst->Argument(2)->Resolve()->ImmediateU32();
                 read[input] = true;
-                perVertex[input] = perVertex[input] || mode < 2u || !IsPixelParameterFlat(*pixel, input);
+                perVertex[input] = perVertex[input] || mode == 1u || !IsPixelParameterFlat(*pixel, input);
             } else if (inst->Opcode() == IrOpcode::GetInterpolationParameterF16) {
                 const auto input = inst->Argument(0)->Resolve()->ImmediateU32();
                 const bool high = inst->Argument(3)->Resolve()->ImmediateU32() != 0u;
@@ -385,6 +387,12 @@ void CollectBuiltinInputs(const IrProgram& program, ShaderInfo& info) {
                     break;
                 case StageInputKind::DispatchThreadLimit:
                     info.dispatchThreadLimit = true;
+                    break;
+                case StageInputKind::RasterPrimitive:
+                    info.rasterPrimitive = true;
+                    break;
+                case StageInputKind::LayerExported:
+                    info.layerExported = true;
                     break;
                 case StageInputKind::PackedAncillary:
                 case StageInputKind::Parameter:

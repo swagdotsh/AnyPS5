@@ -75,7 +75,6 @@ static void EraseCompletions(const std::vector<int>& ids) {
 }
 
 static int CompleteAsync(const char* function, int req_id, const Http2AsyncOption* kqueue_option, const void* option) {
-    if (kqueue_option == nullptr) NotImplemented_nid_no_patch(function);
     if (option != nullptr) NotImplemented_nid_no_patch(function);
     bool queued = false;
     {
@@ -90,6 +89,7 @@ static int CompleteAsync(const char* function, int req_id, const Http2AsyncOptio
         }
     }
     if (!queued) return ERROR_INVALID_ID;
+    if (kqueue_option == nullptr) return 0;
     if (EqueueTriggerEvent_nid_postfix(kqueue_option->equeue, static_cast<uintptr_t>(kqueue_option->user_event_id), EVFILT_USER, kqueue_option->user_data) != 0) {
         {
             std::lock_guard lock(g_completionsMutex);
@@ -354,6 +354,13 @@ int APS5_VABI sceHttp2CreateCookieBox(int lib_http2_ctx_id) {
     const int id = g_nextHandle.fetch_add(1, std::memory_order_relaxed);
     g_handles[id] = {Http2Kind::CookieBox, lib_http2_ctx_id, 0};
     return id;
+}
+
+int APS5_VABI sceHttp2DeleteCookieBox(int cookie_box_id) {
+    std::lock_guard lock(g_handlesMutex);
+    if (FindHandle(cookie_box_id, Http2Kind::CookieBox) == nullptr) return ERROR_INVALID_ID;
+    g_handles.erase(cookie_box_id);
+    return 0;
 }
 
 int APS5_VABI sceHttp2SetCookieBox(int id, int cookie_box_id) {

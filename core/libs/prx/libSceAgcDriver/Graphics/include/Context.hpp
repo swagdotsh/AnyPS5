@@ -4,9 +4,14 @@
 #ifndef VK_NO_PROTOTYPES
 #define VK_NO_PROTOTYPES
 #endif
+#include <mutex>
 #include <vulkan/vulkan.h>
+#include <atomic>
 #include <cstdint>
+#include <cstdio>
 #include <memory>
+#include <mutex>
+#include <shared_mutex>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -25,6 +30,19 @@ class DescriptorCache;
 class SamplerCache;
 class ShaderResources;
 class PlaceholderImages;
+
+class PipelineCacheSynchronization {
+public:
+    using PipelineUseLock = std::shared_lock<std::shared_mutex>;
+    using SnapshotLock = std::unique_lock<std::shared_mutex>;
+
+    PipelineUseLock LockForPipelineUse() const { return PipelineUseLock(mutex); }
+    SnapshotLock LockForSnapshot() const { return SnapshotLock(mutex); }
+    SnapshotLock TryLockForSnapshot() const { return SnapshotLock(mutex, std::try_to_lock); }
+
+private:
+    mutable std::shared_mutex mutex;
+};
 
 inline void Require(bool condition, const std::string& reason) {
     if (!condition) throw std::runtime_error("AGC graphics: " + reason);
@@ -121,6 +139,11 @@ struct Context {
     // Nonzero when VK_EXT_external_memory_host is enabled: the required host pointer alignment.
     VkDeviceSize hostImportAlignment = 0;
     bool dmaBufImport = false;
+    bool sparseBinding = false;
+    std::uint32_t queueFamily = 0;
+    std::uint32_t sparseFamily = VK_QUEUE_FAMILY_IGNORED;
+    VkQueue sparseQueue = VK_NULL_HANDLE;
+    std::mutex* sparseQueueMutex = nullptr;
     PFN_vkGetPhysicalDeviceMemoryProperties2 memoryProperties2 = nullptr;
     RenderCache* renderCache = nullptr;
     DrawQueue* drawQueue = nullptr;
@@ -159,9 +182,11 @@ struct Context {
     bool geometryShader = false;
     bool sampleRateShading = false;
     bool shaderClipDistance = false;
+    bool shaderCullDistance = false;
     bool nullDescriptors = false;
     bool bufferInt64Atomics = false;
     const PlaceholderImages* placeholderImages = nullptr;
+    bool viewportIndexLayer = false;
     bool primitiveListRestart = false;
     bool imageViewMinLod = false;
     bool pipelineExecutableInfo = false;
@@ -172,6 +197,11 @@ struct Context {
     bool provokingVertexModePerPipeline = false;
     bool singlePassStorage = false;
     VkSampleCountFlags sampleLocationSampleCounts = 0;
+    PipelineCacheSynchronization* pipelineCacheSynchronization = nullptr;
+
+    PipelineCacheSynchronization::PipelineUseLock LockPipelineCacheForUse() const {
+        return pipelineCacheSynchronization != nullptr ? pipelineCacheSynchronization->LockForPipelineUse() : PipelineCacheSynchronization::PipelineUseLock{};
+    }
 
     template<typename TFunction>
     TFunction Function(const char* name) const {
@@ -194,6 +224,55 @@ struct Context {
             if ((mask & (1u << i)) != 0 && (memory.memoryTypes[i].propertyFlags & flags) == flags) return i;
         }
         throw std::runtime_error("AGC graphics: required Vulkan memory type is unavailable");
+    }
+
+    std::uint32_t BufferMemoryType(std::uint32_t mask, VkMemoryPropertyFlags flags, VkDeviceSize bytes) const {
+        constexpr VkMemoryPropertyFlags coherent = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        auto type = MemoryType(mask, flags);
+        if (flags == coherent) {
+            for (std::uint32_t i = 0; i < memory.memoryTypeCount; ++i) {
+                if ((mask & (1u << i)) != 0 && (memory.memoryTypes[i].propertyFlags & (coherent | VK_MEMORY_PROPERTY_HOST_CACHED_BIT)) == (coherent | VK_MEMORY_PROPERTY_HOST_CACHED_BIT)) {
+                    type = i;
+                    break;
+                }
+            }
+        }
+        if ((flags & coherent) != coherent || memoryProperties2 == nullptr || physical == VK_NULL_HANDLE) return type;
+        VkPhysicalDeviceMemoryBudgetPropertiesEXT reported{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+        VkPhysicalDeviceMemoryProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, &reported};
+        memoryProperties2(physical, &properties);
+        const auto heap = memory.memoryTypes[type].heapIndex;
+        const auto fits = [&](std::uint32_t candidate) {
+            return reported.heapBudget[candidate] != 0 && reported.heapUsage[candidate] < reported.heapBudget[candidate] && bytes <= reported.heapBudget[candidate] - reported.heapUsage[candidate];
+        };
+        if (reported.heapBudget[heap] == 0 || fits(heap)) return type;
+        for (std::uint32_t i = 0; i < memory.memoryTypeCount; ++i) {
+            const auto& candidate = memory.memoryTypes[i];
+            if ((mask & (1u << i)) != 0 && (candidate.propertyFlags & flags) == flags && candidate.heapIndex != heap && fits(candidate.heapIndex)) return i;
+        }
+        return type;
+    }
+
+    std::uint32_t DeviceMemoryType(std::uint32_t mask, VkDeviceSize bytes, const char* what) const {
+        const auto type = MemoryType(mask, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        if (memoryProperties2 == nullptr || physical == VK_NULL_HANDLE) return type;
+        VkPhysicalDeviceMemoryBudgetPropertiesEXT reported{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+        VkPhysicalDeviceMemoryProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2};
+        properties.pNext = &reported;
+        memoryProperties2(physical, &properties);
+        const auto heap = memory.memoryTypes[type].heapIndex;
+        const auto budget = reported.heapBudget[heap];
+        const auto usage = reported.heapUsage[heap];
+        if (budget == 0 || (usage < budget && bytes <= budget - usage)) return type;
+        for (std::uint32_t i = 0; i < memory.memoryTypeCount; ++i) {
+            if ((mask & (1u << i)) == 0 || (memory.memoryHeaps[memory.memoryTypes[i].heapIndex].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0) continue;
+            static std::atomic<std::uint64_t> placements{0}, placedBytes{0};
+            const auto count = placements.fetch_add(1) + 1;
+            const auto total = placedBytes.fetch_add(bytes) + bytes;
+            if (count <= 5 || (count & (count - 1)) == 0) std::fprintf(stderr, "[gpu] %s: device-local heap %u uses %llu of its %llu MiB budget, %llu bytes placed in host memory type %u; %llu such allocations, %llu MiB\n", what, heap, static_cast<unsigned long long>(usage >> 20u), static_cast<unsigned long long>(budget >> 20u), static_cast<unsigned long long>(bytes), i, static_cast<unsigned long long>(count), static_cast<unsigned long long>(total >> 20u));
+            return i;
+        }
+        return type;
     }
 };
 

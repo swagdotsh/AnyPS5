@@ -10,6 +10,8 @@
 #include <cstring>
 #include <string>
 
+extern "C" std::uint32_t* APS5_VABI sceAgcDcbEventWrite(CommandBuffer* buf, std::uint8_t eventType, const volatile void* address);
+extern "C" std::uint64_t APS5_VABI sceAgcDcbEventWriteGetSize(std::uint8_t eventType);
 extern "C" std::uint32_t* APS5_VABI sceAgcDcbResetQueue(CommandBuffer* buf, std::uint32_t op, std::uint32_t state);
 extern "C" std::uint32_t* APS5_VABI sceAgcDcbClearState(CommandBuffer* buf, std::uint32_t command);
 extern "C" std::uint32_t* APS5_VABI sceAgcDcbSetFlip(CommandBuffer* buf, std::uint32_t handle, std::int32_t index, std::uint32_t mode, std::int64_t argument);
@@ -34,6 +36,10 @@ extern "C" std::uint32_t* APS5_VABI sceAgcDcbSetWorkloadComplete(CommandBuffer* 
 extern "C" int APS5_VABI sceAgcDriverRegisterWorkloadStream(std::uint32_t stream_id, const void* stream);
 extern "C" int APS5_VABI sceAgcDriverUnregisterWorkloadStream(std::uint32_t stream_id);
 extern "C" std::uint32_t* APS5_VABI sceAgcDcbSetWorkloadsActive(CommandBuffer* buf, std::uint32_t stream_id, const std::uint32_t* workload_ids, std::uint32_t workload_count);
+extern "C" std::uint32_t* APS5_VABI sceAgcDcbSetWorkloadStreamInactive(CommandBuffer* buf, std::uint32_t streamId);
+extern "C" std::uint32_t* APS5_VABI sceAgcAcbSetWorkloadsActive(CommandBuffer* buf, std::uint32_t streamId, const std::uint32_t* workloadIds, std::uint32_t workloadCount);
+extern "C" std::uint32_t* APS5_VABI sceAgcAcbSetWorkloadComplete(CommandBuffer* buf, std::uint32_t streamId, std::uint32_t workloadId);
+extern "C" std::uint32_t* APS5_VABI sceAgcAcbSetWorkloadStreamInactive(CommandBuffer* buf, std::uint32_t streamId);
 extern "C" std::uint32_t* APS5_VABI sceAgcDcbSetMarker(CommandBuffer* buf, const char* str, std::uint32_t color);
 extern "C" std::uint32_t* APS5_VABI sceAgcAcbPushMarker(CommandBuffer* buf, const char* str, std::uint32_t color);
 extern "C" std::uint32_t* APS5_VABI sceAgcAcbPopMarker(CommandBuffer* buf);
@@ -45,6 +51,8 @@ extern "C" int APS5_VABI sceAgcDebugRaiseException(std::uint32_t exceptionId);
 extern "C" std::uint32_t* APS5_VABI sceAgcAcbAtomicGds_0900(CommandBuffer* buf, std::uint32_t control, std::uint32_t mode, std::uint32_t gdsOp, std::uint32_t src, std::uint16_t offset, std::uint16_t index, std::uint32_t mask, std::uint32_t data, std::uint64_t compareData, std::uint64_t extraData);
 
 namespace {
+
+constexpr int SCE_AGC_ERROR_INVALID_ARGUMENT = static_cast<int>(0x80890001);
 
 void check(bool condition, const char* message) {
     if (!condition) {
@@ -242,6 +250,59 @@ void testWorkloads() {
     check(sceAgcDcbSetWorkloadComplete(nullptr, 1, 3) == nullptr, "null command buffer accepted for complete");
     check(sceAgcDriverUnregisterWorkloadStream(1) == 0, "workload stream unregistration failed");
     check(sceAgcDcbSetWorkloadComplete(&dcb.buffer, 1, 3) == nullptr, "workload complete packet after unregistration");
+}
+
+void testWorkloadStreams() {
+    struct Vector {
+        std::uint32_t streamId;
+        std::uintptr_t workloadIds;
+        std::uint32_t workloadCount;
+        std::uint32_t workloadId;
+    };
+    const std::array<Vector, 3> vectors{{
+        {0x11111111u, 0x22222222u, 0x33333333u, 0x22222222u},
+        {1, 2, 3, 2},
+        {0x22222222u, static_cast<std::uintptr_t>(0x3333333344444444ull), 0, 0x44444444u}}};
+    for (const auto& vector : vectors) {
+        Storage storage;
+        storage.words.fill(0xdeadbeefu);
+        const auto before = storage.words;
+        const auto* ids = reinterpret_cast<const std::uint32_t*>(vector.workloadIds);
+        check(sceAgcDcbSetWorkloadsActive(&storage.buffer, vector.streamId, ids, vector.workloadCount) == nullptr, "DCB workloads active returned a packet for an unregistered stream");
+        check(sceAgcDcbSetWorkloadComplete(&storage.buffer, vector.streamId, vector.workloadId) == nullptr, "DCB workload complete returned a packet for an unregistered stream");
+        check(sceAgcDcbSetWorkloadStreamInactive(&storage.buffer, vector.streamId) == nullptr, "DCB workload stream inactive returned a packet for an unregistered stream");
+        check(sceAgcAcbSetWorkloadsActive(&storage.buffer, vector.streamId, ids, vector.workloadCount) == nullptr, "ACB workloads active returned a packet for an unregistered stream");
+        check(sceAgcAcbSetWorkloadComplete(&storage.buffer, vector.streamId, vector.workloadId) == nullptr, "ACB workload complete returned a packet for an unregistered stream");
+        check(sceAgcAcbSetWorkloadStreamInactive(&storage.buffer, vector.streamId) == nullptr, "ACB workload stream inactive returned a packet for an unregistered stream");
+        check(storage.words == before && storage.buffer.cursor_up == storage.words.data(), "a workload call for an unregistered stream wrote to the buffer");
+    }
+
+    const std::uint32_t ids[2] = {3, 4};
+    Storage exhausted;
+    exhausted.buffer.cursor_down = exhausted.words.data() + 3;
+    const auto before = exhausted.words;
+    check(sceAgcDcbSetWorkloadStreamInactive(&exhausted.buffer, 1) == nullptr && sceAgcAcbSetWorkloadsActive(&exhausted.buffer, 1, ids, 2) == nullptr &&
+        sceAgcAcbSetWorkloadComplete(&exhausted.buffer, 1, 3) == nullptr && sceAgcAcbSetWorkloadStreamInactive(&exhausted.buffer, 1) == nullptr,
+        "a workload call for an unregistered stream on an exhausted buffer returned a packet");
+    check(exhausted.words == before && exhausted.buffer.cursor_up == exhausted.words.data(), "a workload call for an unregistered stream modified an exhausted buffer");
+    check(sceAgcDcbSetWorkloadStreamInactive(nullptr, 1) == nullptr && sceAgcAcbSetWorkloadsActive(nullptr, 1, ids, 2) == nullptr &&
+        sceAgcAcbSetWorkloadComplete(nullptr, 1, 3) == nullptr && sceAgcAcbSetWorkloadStreamInactive(nullptr, 1) == nullptr,
+        "a workload call with a null command buffer returned a packet");
+
+    const std::uint32_t record[8] = {};
+    check(sceAgcDriverRegisterWorkloadStream(1, record) == 0, "workload stream registration failed");
+    Storage registered;
+    registered.words.fill(0xdeadbeefu);
+    const auto untouched = registered.words;
+    expectFailure([&] { sceAgcDcbSetWorkloadStreamInactive(&registered.buffer, 1); });
+    expectFailure([&] { sceAgcAcbSetWorkloadsActive(&registered.buffer, 1, ids, 2); });
+    expectFailure([&] { sceAgcAcbSetWorkloadComplete(&registered.buffer, 1, 3); });
+    expectFailure([&] { sceAgcAcbSetWorkloadStreamInactive(&registered.buffer, 1); });
+    check(registered.words == untouched && registered.buffer.cursor_up == registered.words.data(), "a workload call that threw modified the buffer");
+    check(sceAgcDcbSetWorkloadStreamInactive(nullptr, 1) == nullptr && sceAgcAcbSetWorkloadsActive(nullptr, 1, ids, 2) == nullptr &&
+        sceAgcAcbSetWorkloadComplete(nullptr, 1, 3) == nullptr && sceAgcAcbSetWorkloadStreamInactive(nullptr, 1) == nullptr,
+        "a workload call with a null command buffer for a registered stream returned a packet");
+    check(sceAgcDriverUnregisterWorkloadStream(1) == 0, "workload stream unregistration failed");
 }
 
 void testIndexBuffer() {
@@ -565,8 +626,10 @@ void testDefaults() {
     expectFailure([] { sceAgcInit_0090(nullptr, 8); });
     expectFailure([&] { sceAgcInit_0090(&state, 14); });
     check(sceAgcInit(8) == 0, "AGC version initialization failed");
-    expectFailure([] { sceAgcInit(14); });
-    expectFailure([] { sceAgcInit(0xffffffffu); });
+    check(sceAgcInit(13) == 0, "AGC version 13 initialization failed");
+    check(sceAgcInit(14) == SCE_AGC_ERROR_INVALID_ARGUMENT, "unsupported AGC version did not return invalid argument");
+    check(sceAgcInit(0xffffffffu) == SCE_AGC_ERROR_INVALID_ARGUMENT, "maximum AGC version did not return invalid argument");
+    check(sceAgcInit(0xffffc278u) == SCE_AGC_ERROR_INVALID_ARGUMENT, "pointer-valued AGC argument did not return invalid argument");
     for (std::uint32_t version = 0; version < 14; ++version) {
         for (const bool internal : {false, true}) {
             auto* first = Agc::Command::GetRegisterDefaults(version, internal, __func__);
@@ -580,6 +643,47 @@ void testDefaults() {
     expectFailure([] { Agc::Command::GetRegisterDefaults(0xffffffffu, true, __func__); });
 }
 
+void testEventWrite() {
+    Storage storage;
+    const auto* samplePacket = sceAgcDcbEventWrite(&storage.buffer, 0x38, reinterpret_cast<const void*>(0x1000));
+    check(samplePacket == storage.words.data(), "incorrect event 0x38 return pointer");
+    check(storage.words[0] == 0xc0024600u, "incorrect event 0x38 packet header");
+    check(storage.words[1] == (0x100u | 0x38u), "incorrect event 0x38 first payload word");
+    check(storage.words[2] == 0x1000u, "incorrect event 0x38 low address word");
+    check(storage.words[3] == 0u, "incorrect event 0x38 high address word");
+    check(sceAgcDcbEventWriteGetSize(0x38) == 16, "incorrect event 0x38 size");
+    check(sceAgcDcbEventWriteGetSize(0x39) == 16, "incorrect event 0x39 size");
+
+    Storage sample39;
+    sceAgcDcbEventWrite(&sample39.buffer, 0x39, reinterpret_cast<const void*>(0x2008));
+    check(sample39.words[0] == 0xc0024600u && sample39.words[1] == (0x100u | 0x39u) && sample39.words[2] == 0x2008u && sample39.words[3] == 0u, "incorrect event 0x39 packet");
+
+    expectFailure([&] { sceAgcDcbEventWrite(&storage.buffer, 0x38, reinterpret_cast<const void*>(0x1001)); });
+    expectFailure([&] { sceAgcDcbEventWrite(&storage.buffer, 0x40, nullptr); });
+
+    Storage partialFlush;
+    sceAgcDcbEventWrite(&partialFlush.buffer, 7, nullptr);
+    check(partialFlush.words[0] == 0xc0004600u && partialFlush.words[1] == 0x407u, "incorrect event 7 partial flush packet");
+    check(sceAgcDcbEventWriteGetSize(7) == 8, "incorrect event 7 size");
+
+    Storage partialFlush15;
+    sceAgcDcbEventWrite(&partialFlush15.buffer, 15, nullptr);
+    check(partialFlush15.words[0] == 0xc0004600u && partialFlush15.words[1] == 0x40fu, "incorrect event 15 partial flush packet");
+
+    Storage partialFlush16;
+    sceAgcDcbEventWrite(&partialFlush16.buffer, 16, nullptr);
+    check(partialFlush16.words[0] == 0xc0004600u && partialFlush16.words[1] == 0x410u, "incorrect event 16 partial flush packet");
+
+    Storage cacheFlushNull;
+    sceAgcDcbEventWrite(&cacheFlushNull.buffer, 0x16, nullptr);
+    check(cacheFlushNull.words[0] == 0xc0004600u && cacheFlushNull.words[1] == 0x16u, "incorrect event 0x16 null address packet");
+    check(sceAgcDcbEventWriteGetSize(0x16) == 8, "incorrect event 0x16 size");
+
+    Storage cacheFlushWithAddress;
+    sceAgcDcbEventWrite(&cacheFlushWithAddress.buffer, 0x16, reinterpret_cast<const void*>(0x2d2a10000ull));
+    check(cacheFlushWithAddress.words[0] == 0xc0004600u && cacheFlushWithAddress.words[1] == 0x16u, "incorrect event 0x16 with address packet");
+}
+
 }
 
 int main(int argc, char** argv) {
@@ -591,11 +695,13 @@ int main(int argc, char** argv) {
             return 0;
         }
         testPackets();
+        testEventWrite();
         testNop();
         testClearState();
         testIndexedIndirectDraws();
         testMarkers();
         testWorkloads();
+        testWorkloadStreams();
         testIndexBuffer();
         testIndirectBase();
         testContextState();

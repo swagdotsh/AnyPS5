@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdio>
+#include <cstdlib>
 #include <exception>
 #include <fstream>
 #include <initializer_list>
@@ -342,16 +343,10 @@ void verifyLargeLoopExitFallback() {
     static_cast<void>(recompile(name, code, 64u));
 }
 
-void verifyNestedExitForwarders() {
+std::vector<std::uint32_t> branchProgram(std::span<const std::array<std::uint32_t, 2>> targets, std::span<const std::uint32_t> order) {
     constexpr auto none = InvalidControlFlowId;
-    constexpr std::array<std::array<std::uint32_t, 2>, 21> targets{{
-        {1, none}, {2, none}, {2, 3}, {2, 4}, {5, 6}, {1, 7}, {8, 9}, {10, none},
-        {11, 12}, {13, 14}, {1, 15}, {16, none}, {9, none}, {17, 18}, {19, none},
-        {16, none}, {none, none}, {16, none}, {15, 20}, {10, none}, {19, none},
-    }};
-    constexpr std::array<std::uint32_t, 21> order{0, 1, 2, 3, 4, 6, 9, 14, 19, 10, 15, 13, 18, 20, 17, 8, 12, 11, 5, 7, 16};
     std::vector<std::uint32_t> code;
-    std::array<std::size_t, targets.size()> starts{};
+    std::vector<std::size_t> starts(targets.size());
     std::vector<std::pair<std::size_t, std::uint32_t>> patches;
     for (std::size_t at = 0; at < order.size(); ++at) {
         const auto block = order[at];
@@ -377,11 +372,35 @@ void verifyNestedExitForwarders() {
     }
     for (const auto& [instruction, target] : patches) {
         const auto displacement = static_cast<std::int64_t>(starts[target]) - static_cast<std::int64_t>(instruction) - 1;
-        require(displacement >= -32768 && displacement <= 32767, "nested exit forwarder test branch is out of range");
+        require(displacement >= -32768 && displacement <= 32767, "a generated test branch is out of range");
         code[instruction] |= static_cast<std::uint32_t>(displacement) & 0xffffu;
     }
+    return code;
+}
+
+void verifyNestedExitForwarders() {
+    constexpr auto none = InvalidControlFlowId;
+    constexpr std::array<std::array<std::uint32_t, 2>, 21> targets{{
+        {1, none}, {2, none}, {2, 3}, {2, 4}, {5, 6}, {1, 7}, {8, 9}, {10, none},
+        {11, 12}, {13, 14}, {1, 15}, {16, none}, {9, none}, {17, 18}, {19, none},
+        {16, none}, {none, none}, {16, none}, {15, 20}, {10, none}, {19, none},
+    }};
+    constexpr std::array<std::uint32_t, 21> order{0, 1, 2, 3, 4, 6, 9, 14, 19, 10, 15, 13, 18, 20, 17, 8, 12, 11, 5, 7, 16};
+    const auto code = branchProgram(targets, order);
     const std::string name("nested exit forwarders keep conditional selections structured");
     static_cast<void>(verifyGraph(name, code));
+    static_cast<void>(recompile(name, code, 32u));
+    static_cast<void>(recompile(name, code, 64u));
+}
+
+void verifyIrreducibleLoopEntry() {
+    constexpr auto none = InvalidControlFlowId;
+    constexpr std::array<std::array<std::uint32_t, 2>, 4> targets{{{1, 2}, {2, 3}, {1, 3}, {none, none}}};
+    constexpr std::array<std::uint32_t, 4> order{0, 1, 2, 3};
+    const auto code = branchProgram(targets, order);
+    const std::string name("a loop entered at either of its two blocks runs behind reach flags");
+    const auto result = verifyGraph(name, code);
+    require(result.clonedInstructions == 0 && result.routeVariables != 0, name + ": expected the reach flag fallback, got " + std::to_string(result.clonedInstructions) + " cloned instructions and " + std::to_string(result.routeVariables) + " route variables");
     static_cast<void>(recompile(name, code, 32u));
     static_cast<void>(recompile(name, code, 64u));
 }
@@ -389,7 +408,9 @@ void verifyNestedExitForwarders() {
 void verifyProgram(const Program& program) {
     const std::string name(program.name);
     const auto result = verifyGraph(name, program.code);
-    if (program.split == Split::None) {
+    if (std::getenv("APS5_FORCE_STRUCTURIZER_FALLBACK") != nullptr) {
+        require(result.clonedInstructions == 0 && result.routeVariables != 0, name + ": expected the reach flag fallback, got " + std::to_string(result.clonedInstructions) + " cloned instructions and " + std::to_string(result.routeVariables) + " route variables");
+    } else if (program.split == Split::None) {
         require(result.clonedInstructions == 0 && result.routeVariables == 0, name + ": expected no clone or routing, got " + std::to_string(result.clonedInstructions) + " cloned instructions and " + std::to_string(result.routeVariables) + " route variables");
     } else if (program.split == Split::Clone) {
         require(result.clonedInstructions != 0 && result.routeVariables == 0, name + ": expected a clone, got " + std::to_string(result.clonedInstructions) + " cloned instructions and " + std::to_string(result.routeVariables) + " route variables");
@@ -1119,6 +1140,29 @@ early_exit:
          {0x7e020280u, 0xbf06c002u, 0xbf850003u, 0x4a020081u, 0xbf068003u, 0xbf850006u, 0x7d880088u, 0xbf870001u, 0x4a020282u, 0xe0700000u,
           0x80000100u, 0xbf810000u, 0xbefe0480u, 0xbf810000u},
          Split::None},
+        {"early exit arm beside a parent arm that reaches the same merge", R"(
+  v_mov_b32 v1, 0
+  s_cmp_eq_u32 s2, 64
+  s_cbranch_scc1 other
+  v_add_nc_u32 v1, 1, v0
+  s_cmp_eq_u32 s3, 0
+  s_cbranch_scc1 early_exit
+join:
+  v_cmp_gt_u32 vcc, 8, v0
+  s_cbranch_vccnz store
+  v_add_nc_u32 v1, 2, v1
+store:
+  buffer_store_dword v1, off, s[0:3], 0
+  s_endpgm
+other:
+  v_add_nc_u32 v1, 3, v0
+  s_branch join
+early_exit:
+  s_mov_b64 exec, 0
+  s_endpgm)",
+         {0x7e020280u, 0xbf06c002u, 0xbf850009u, 0x4a020081u, 0xbf068003u, 0xbf850008u, 0x7d880088u, 0xbf870001u, 0x4a020282u, 0xe0700000u,
+          0x80000100u, 0xbf810000u, 0x4a020083u, 0xbf82fff8u, 0xbefe0480u, 0xbf810000u},
+         Split::None},
         {"return block entered from the return block after it", R"(
   v_mov_b32 v1, 0
   s_cmp_eq_u32 s2, 64
@@ -1258,6 +1302,7 @@ done:
         verifyNullSwappc();
         verifyLargeLoopExitFallback();
         verifyNestedExitForwarders();
+        verifyIrreducibleLoopEntry();
     } catch (const std::exception& error) {
         std::fprintf(stderr, "%s\n", error.what());
         ++failures;

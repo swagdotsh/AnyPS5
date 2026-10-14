@@ -6,6 +6,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from check_conventions import STUB_BODY, SYSTEM_DEPENDENCY, Check, function_body, links, output
@@ -39,6 +40,18 @@ class FunctionBodyTests(unittest.TestCase):
         source = 'int APS5_VABI sceExample() {\nuse("// }", "/* { */");\nreturn 0;\n}'
         self.assertEqual(function_body(source.splitlines(), 0), 'use("","");return0;')
 
+    def test_raw_literal_braces_and_comments_preserve_following_statements(self):
+        source = 'int APS5_VABI sceExample() {\nuse(R"json({"brace":"}","comment":"/* hidden */"})json");\nvalidate();\nreturn 0;\n}'
+        body = function_body(source.splitlines(), 0)
+        self.assertEqual(body, 'use("");validate();return0;')
+        self.assertIsNone(STUB_BODY.fullmatch(body))
+
+    def test_raw_literal_return_keeps_a_literal_sentinel(self):
+        source = 'const char* APS5_VABI sceExample() { return R"json({"url":"https://example.test"})json"; }'
+        body = function_body(source.splitlines(), 0)
+        self.assertEqual(body, 'return"";')
+        self.assertIsNone(STUB_BODY.fullmatch(body))
+
     def test_apostrophes_in_comments_do_not_open_character_literals(self):
         source = "int APS5_VABI sceExample() {\n// don't fail here\nvalidate();\n// it's fine\nreturn 0;\n}"
         body = function_body(source.splitlines(), 0)
@@ -56,6 +69,59 @@ class FunctionBodyTests(unittest.TestCase):
     def test_unterminated_function_has_no_body(self):
         source = "int APS5_VABI sceExample() {\n// pending implementation\nreturn 0;"
         self.assertIsNone(function_body(source.splitlines(), 0))
+
+
+class RawLiteralCommentTests(unittest.TestCase):
+    path = "core/example.cpp"
+
+    def findings(self, source, added):
+        check = Check.__new__(Check)
+        check.tree = set()
+        check.status = {}
+        check.findings = []
+        lines = source.split("\n")
+        check.added = {self.path: [(number, lines[number - 1]) for number in added]}
+        with patch.object(check, "show", return_value=source), patch.object(check, "duplicates"):
+            check.code()
+        return check.findings
+
+    def test_isolated_checker_loads_its_trusted_sibling_from_another_directory(self):
+        checker = Path(__file__).resolve().parents[1] / "check_conventions.py"
+        with tempfile.TemporaryDirectory() as directory:
+            Path(directory, "nid_names.py").write_text('raise RuntimeError("untrusted current directory")\n', encoding="utf-8")
+            result = subprocess.run([sys.executable, "-I", str(checker), "--help"], cwd=directory, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("check a branch", result.stdout)
+
+    def test_raw_url_does_not_create_a_comment(self):
+        source = 'static const char* Metadata = R"json({"url":"https://example.test"})json";'
+        self.assertEqual(self.findings(source, [1]), [])
+
+    def test_blank_added_cpp_lines_preserve_positions(self):
+        for source, added in (("\n", [1]), ("int value;\n\n", [2])):
+            with self.subTest(source=source):
+                self.assertEqual(self.findings(source, added), [])
+
+    def test_unicode_separators_in_literals_keep_physical_lines(self):
+        for separator in ("\x85", "\u2028", "\u2029"):
+            with self.subTest(separator=separator):
+                source = f'static const char* Metadata = R"text(https://example.test/{separator}more)text";\nint value; // pending\n'
+                self.assertEqual(self.findings(source, [1, 2]), [("comment", self.path, 2, "")])
+
+    def test_added_line_inside_an_existing_multiline_raw_literal_is_not_a_comment(self):
+        source = 'static const char* Metadata = R"text(\nhttps://example.test/metadata\n)text";\n'
+        self.assertEqual(self.findings(source, [2]), [])
+
+    def test_actual_comment_after_a_raw_literal_retains_its_line(self):
+        for comment in ("// pending implementation", "/* pending implementation */"):
+            with self.subTest(comment=comment):
+                source = f'static const char* Metadata = R"text(\nhttps://example.test/metadata\n)text"; {comment}\n'
+                self.assertEqual(self.findings(source, [2, 3]), [("comment", self.path, 3, "")])
+
+    def test_quotes_and_raw_looking_text_do_not_hide_actual_comments(self):
+        for comment in ('// " R"text(https://example.test)text"', '/* " R"text(https://example.test)text" */'):
+            with self.subTest(comment=comment):
+                self.assertEqual(self.findings(comment, [1]), [("comment", self.path, 1, "")])
 
 
 class SilentStubTests(unittest.TestCase):
@@ -134,9 +200,10 @@ class QuotedPathTests(unittest.TestCase):
 
 class SilentStubSectionTests(unittest.TestCase):
     path = "core/libs/prx/libSceExample/Export.cpp"
-    entry = f"- [Existing limitation](../../{path}) - console layout is unknown.\n"
+    entry = f"- [Existing limitation](../../../{path}) - console layout is unknown.\n"
+    library_debt = "docs/dev/debt/libSceExample.md"
 
-    def check_stub(self, debt_text):
+    def check_stub(self, debt_text, debt_path=library_debt):
         checker = Path(__file__).resolve().parents[1] / "check_conventions.py"
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -160,7 +227,8 @@ class SilentStubSectionTests(unittest.TestCase):
             git("commit", "-qm", "docs: record technical debt")
             source = root / self.path
             source.write_text("int APS5_VABI sceExample() { return 0; }\n", encoding="utf-8")
-            debt.write_text(debt_text, encoding="utf-8")
+            (root / debt_path).parent.mkdir(parents=True, exist_ok=True)
+            (root / debt_path).write_text(debt_text, encoding="utf-8")
             git("add", ".")
             git("commit", "-qm", "feat: add example export")
             env = {key: value for key, value in os.environ.items()
@@ -171,53 +239,139 @@ class SilentStubSectionTests(unittest.TestCase):
                 cwd=root, capture_output=True, text=True, env=env, timeout=10,
             )
 
-    def require_rejected(self, debt):
-        result = self.check_stub(debt)
+    def require_rejected(self, debt, debt_path=library_debt):
+        result = self.check_stub(debt, debt_path)
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertIn("[silent-stub]", result.stdout)
         self.assertNotIn("[doc-link]", result.stdout)
+        self.assertNotIn("[debt-file]", result.stdout)
 
-    def require_accepted(self, debt):
-        result = self.check_stub(debt)
+    def require_accepted(self, debt, debt_path=library_debt):
+        result = self.check_stub(debt, debt_path)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("All conventions checks passed", result.stdout)
 
     def test_debt_outside_silent_stubs_does_not_exempt_export(self):
         for section in ("Build", "Unknown function info", "Functional"):
             with self.subTest(section=section):
-                self.require_rejected(f"# Project technical debt\n\n### {section}\n\n{self.entry}")
+                self.require_rejected(f"# libSceExample technical debt\n\n### {section}\n\n{self.entry}")
 
     def test_entries_after_silent_stubs_do_not_exempt_export(self):
         for heading in ("# Other debt", "## Other debt", "### Functional"):
             with self.subTest(heading=heading):
-                self.require_rejected(f"# Project technical debt\n\n### Silent stubs\n\n{heading}\n\n{self.entry}")
+                self.require_rejected(f"# libSceExample technical debt\n\n### Silent stubs\n\n{heading}\n\n{self.entry}")
 
     def test_file_entry_in_silent_stubs_exempts_export(self):
-        self.require_accepted(f"# Project technical debt\n\n### Silent stubs\n\n{self.entry}")
+        self.require_accepted(f"# libSceExample technical debt\n\n### Silent stubs\n\n{self.entry}")
 
     def test_named_entry_in_same_library_exempts_export(self):
-        entry = "- sceExample: [reference](../../core/libs/prx/libSceExample/Reference.hpp)\n"
-        self.require_accepted(f"# Project technical debt\n\n### Silent stubs\n\n{entry}")
+        entry = "- sceExample: [reference](../../../core/libs/prx/libSceExample/Reference.hpp)\n"
+        self.require_accepted(f"# libSceExample technical debt\n\n### Silent stubs\n\n{entry}")
 
     def test_named_entry_in_another_library_does_not_exempt_export(self):
-        entry = "- sceExample: [reference](../../core/libs/prx/libSceOther/Reference.hpp)\n"
-        self.require_rejected(f"# Project technical debt\n\n### Silent stubs\n\n{entry}")
+        entry = "- sceExample: [reference](../../../core/libs/prx/libSceOther/Reference.hpp)\n"
+        self.require_rejected(f"# libSceOther technical debt\n\n### Silent stubs\n\n{entry}", "docs/dev/debt/libSceOther.md")
 
     def test_different_function_in_same_library_does_not_exempt_export(self):
-        entry = "- sceExampleOther: [reference](../../core/libs/prx/libSceExample/Reference.hpp)\n"
-        self.require_rejected(f"# Project technical debt\n\n### Silent stubs\n\n{entry}")
+        entry = "- sceExampleOther: [reference](../../../core/libs/prx/libSceExample/Reference.hpp)\n"
+        self.require_rejected(f"# libSceExample technical debt\n\n### Silent stubs\n\n{entry}")
 
     def test_subsection_in_silent_stubs_keeps_exemption(self):
-        self.require_accepted(f"# Project technical debt\n\n### Silent stubs\n\n#### Dialogs\n\n{self.entry}")
+        self.require_accepted(f"# libSceExample technical debt\n\n### Silent stubs\n\n#### Dialogs\n\n{self.entry}")
+
+    def test_entry_in_the_index_still_exempts_export(self):
+        entry = self.entry.replace("../../../", "../../")
+        result = self.check_stub(f"# Project technical debt\n\n### Silent stubs\n\n{entry}", "docs/dev/TechnicalDebt.md")
+        self.assertNotIn("[silent-stub]", result.stdout)
+
+    def test_library_entry_in_the_index_is_rejected(self):
+        entry = self.entry.replace("../../../", "../../")
+        result = self.check_stub(f"# Project technical debt\n\n### Silent stubs\n\n{entry}", "docs/dev/TechnicalDebt.md")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("docs/dev/TechnicalDebt.md:5: error: [debt-file]", result.stdout)
+        self.assertIn("docs/dev/debt/libSceExample.md", result.stdout)
+
+    def test_library_entry_in_another_library_file_is_rejected(self):
+        result = self.check_stub(f"# libSceOther technical debt\n\n### Silent stubs\n\n{self.entry}", "docs/dev/debt/libSceOther.md")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("docs/dev/debt/libSceOther.md:5: error: [debt-file]", result.stdout)
+
+    def test_component_entry_goes_in_the_component_file(self):
+        result = self.check_stub(f"# shader technical debt\n\n### Functional\n\n- [Example](../../../{self.path}) - gap.\n".replace("libs/prx/libSceExample", "shader"), "docs/dev/debt/shader.md")
+        self.assertNotIn("[debt-file]", result.stdout + result.stderr)
+
+    def test_entry_goes_with_its_first_core_link(self):
+        entry = f"- [Recompiler](../../../core/shader/Example.cpp) - needs [a driver feature](../../../{self.path}).\n"
+        result = self.check_stub(f"# libSceExample technical debt\n\n### Functional\n\n{entry}")
+        self.assertIn("docs/dev/debt/libSceExample.md:5: error: [debt-file]", result.stdout)
+        self.assertIn("docs/dev/debt/shader.md", result.stdout)
+
+    def test_entry_without_a_core_link_stays_in_the_index(self):
+        result = self.check_stub("# Project technical debt\n\n### Build\n\n- A toolchain limitation.\n", "docs/dev/TechnicalDebt.md")
+        self.assertNotIn("[debt-file]", result.stdout + result.stderr)
+
+
+class TestFixtureExportTests(unittest.TestCase):
+    def check(self, path, text):
+        checker = Path(__file__).resolve().parents[1] / "check_conventions.py"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+
+            def git(*args):
+                return subprocess.run(
+                    ["git", "-c", f"safe.directory={root}", "-c", "user.name=Conventions Test",
+                     "-c", "user.email=test@example.com", "-c", "commit.gpgsign=false", *args],
+                    cwd=root, capture_output=True, text=True, check=True,
+                )
+
+            def write(relative, content):
+                target = root / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(content, encoding="utf-8")
+
+            git("init", "-q")
+            write("core/libs/prx/libkernel/src/Time.cpp", "std::uint64_t APS5_VABI sceKernelGetProcessTime() { return now(); }\n")
+            write("core/libs/prx/libSceNgs2/tests/Render.cpp", "static int APS5_VABI Process(int value) { return value; }\n")
+            git("add", ".")
+            git("commit", "-qm", "feat: add libraries")
+            write(path, text)
+            git("add", ".")
+            git("commit", "-qm", "feat: add source")
+            env = {key: value for key, value in os.environ.items()
+                   if key not in ("GITHUB_EVENT_PATH", "GITHUB_STEP_SUMMARY", "GITHUB_ACTIONS")}
+            env.update(GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="safe.directory", GIT_CONFIG_VALUE_0=str(root))
+            return subprocess.run(
+                [sys.executable, "-I", str(checker), "--base", "HEAD~1"],
+                cwd=root, capture_output=True, text=True, env=env, timeout=20,
+            )
+
+    def test_mock_in_tests_directory_is_not_an_export(self):
+        result = self.check("core/libs/prx/libSceAudioOut/tests/Shutdown.cpp",
+                            'extern "C" std::uint64_t APS5_VABI sceKernelGetProcessTime() { return 0; }\n')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("All conventions checks passed", result.stdout)
+
+    def test_export_named_like_a_test_fixture_is_not_a_duplicate(self):
+        result = self.check("core/libs/prx/libSceAjm/src/Port.cpp", "int APS5_VABI Process(int value) { return value + 1; }\n")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("All conventions checks passed", result.stdout)
+
+    def test_export_in_another_library_is_still_a_duplicate(self):
+        result = self.check("core/libs/prx/libSceAudioOut/src/Clock.cpp", "std::uint64_t APS5_VABI sceKernelGetProcessTime() { return now(); }\n")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("core/libs/prx/libSceAudioOut/src/Clock.cpp:1: error: [duplicate-export]", result.stdout)
+        self.assertIn("sceKernelGetProcessTime is also in libkernel", result.stdout)
 
 
 class PullRequestTemplateTests(unittest.TestCase):
-    def findings(self, line):
+    def body_findings(self, body):
         check = Check.__new__(Check)
         check.findings = []
-        body = f"### What\nx\n### Tested\nLinux\n### Checklist\n{line}\n- [x] Depends on: none\n- [x] AI-assisted: no\n"
         check.pull_request("fix: x", body)
         return check.findings
+
+    def findings(self, line):
+        return self.body_findings(f"### What\nx\n### Tested\nLinux\n### Checklist\n{line}\n- [x] Depends on: none\n- [x] AI-assisted: no\n")
 
     def test_unchecked_items_with_any_bullet_are_reported(self):
         for bullet in ("-", "*", "+"):
@@ -226,6 +380,14 @@ class PullRequestTemplateTests(unittest.TestCase):
 
     def test_checked_item_is_accepted(self):
         self.assertEqual(self.findings("- [x] all"), [])
+
+    def test_subsections_stay_inside_their_section(self):
+        body = "### What\nx\n### Tested\n#### Linux\nctest\n#### Windows\nctest\n### Checklist\n- [x] Depends on: none\n- [x] AI-assisted: no\n"
+        self.assertEqual(self.body_findings(body), [])
+
+    def test_unchecked_item_after_a_checklist_subsection_is_reported(self):
+        body = "### What\nx\n### Tested\nLinux\n### Checklist\n- [x] Depends on: none\n- [x] AI-assisted: no\n#### Later\n- [ ] all\n"
+        self.assertEqual(self.body_findings(body), [("pr-template", "", 0, "unchecked: all")])
 
 
 class SpacedPathTests(unittest.TestCase):
@@ -335,6 +497,44 @@ class RepositoryChecksTests(unittest.TestCase):
         check = Check("HEAD~1", "HEAD")
         check.code()
         self.assertIn(("comment", "core/example.cpp", 3, ""), check.findings)
+
+    def test_unicode_raw_literals_keep_git_patch_and_grep_records_intact(self):
+        literals = 'R"text(foo\u2028+tail\u2029+tail)text"'
+        fixtures = (
+            ("core/example.cpp", f"static const char* Metadata = {literals};\n"),
+            ("core/libs/prx/libSceExample/Export.cpp", f"const char* APS5_VABI sceGetLabel() {{ return {literals}; }}\n"),
+        )
+        for name, definition in fixtures:
+            with self.subTest(path=name):
+                path = self.root / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(definition + "int value; // pending\n", encoding="utf-8")
+                self.commit()
+                check = Check("HEAD~1", "HEAD")
+                self.assertEqual([number for number, _ in check.added[name]], [1, 2])
+                check.code()
+                self.assertEqual(check.findings, [("comment", name, 2, "")])
+
+    def test_checks_from_a_subdirectory_see_the_whole_repository(self):
+        definition = "int APS5_VABI sceFooBar(int a, int b) { return a + b; }\n"
+        first = self.root / "core/libs/prx/libSceA/Export.cpp"
+        first.parent.mkdir(parents=True)
+        first.write_text(definition, encoding="utf-8")
+        (self.root / "tools").mkdir()
+        (self.root / "tools/tool.py").write_text("print()\n", encoding="utf-8")
+        self.commit()
+        second = self.root / "core/libs/prx/libSceB/Export.cpp"
+        second.parent.mkdir(parents=True)
+        second.write_text(definition, encoding="utf-8")
+        (self.root / "docs").mkdir()
+        (self.root / "docs/guide.md").write_text("[export](../core/libs/prx/libSceA/Export.cpp)\n", encoding="utf-8")
+        self.commit()
+        os.chdir(self.root / "tools")
+        check = Check("HEAD~1", "HEAD")
+        check.code()
+        check.docs()
+        self.assertEqual(check.findings,
+                         [("duplicate-export", "core/libs/prx/libSceB/Export.cpp", 1, "sceFooBar is also in libSceA")])
 
     def test_submodule_outside_thirdparty_reports_without_crashing(self):
         head = self.git("rev-parse", "HEAD")
